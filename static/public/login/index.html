@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="es-MX">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Inicia sesión — CUVALLES Messenger</title>
+
+    <!-- Hoja de estilos: la definimos en el siguiente paso -->
+    <link rel="stylesheet" href="styles.css" />
+
+    <!-- Fuente opcional (puedes quitarla si no la usarás en CSS) -->
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  </head>
+
+  <body class="login-page">
+    <main class="login-container" aria-labelledby="titulo-login">
+      <!-- Columna izquierda: imagen / hero -->
+      <section class="login-hero" aria-hidden="true">
+        <!-- Cambia la ruta por tu imagen dentro de /static/public -->
+        <img
+          src="images.jpg"
+          alt=""
+          class="hero-img"
+          loading="lazy"
+        />
+      </section>
+
+      <!-- Columna derecha: tarjeta de login -->
+      <section class="login-panel">
+        <div class="login-card" role="form">
+          <header class="login-header">
+            <h1 id="titulo-login" class="login-title">Inicia sesión:</h1>
+          </header>
+
+          <!--
+            IMPORTANTE: FastAPI (OAuth2PasswordRequestForm) espera
+            names EXACTOS: username y password via POST (x-www-form-urlencoded).
+            La acción /auth/login devuelve JSON con el token.
+          -->
+          <form class="login-form" action="/auth/login" method="post" autocomplete="on">
+            <div class="form-group">
+              <label for="username" class="form-label">Usuario</label>
+              <input
+                id="username"
+                name="username"
+                type="text"
+                class="form-input"
+                placeholder="tu.usuario"
+                required
+                autocomplete="username"
+                inputmode="latin"
+              />
+            </div>
+
+            <div class="form-group">
+              <label for="password" class="form-label">Contraseña</label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                class="form-input"
+                placeholder="••••••••"
+                required
+                autocomplete="current-password"
+              />
+            </div>
+
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">Inicio</button>
+            </div>
+
+            <!-- Espacio para mostrar errores (lo manejaremos con JS si lo deseas) -->
+            <p id="login-error" class="form-error" role="alert" aria-live="polite"></p>
+          </form>
+
+          <!-- Enlaces auxiliares opcionales -->
+          <footer class="login-footer">
+            <a href="#" class="link-muted">¿Olvidaste tu contraseña?</a>
+            <span class="divider" aria-hidden="true">·</span>
+            <a href="#" class="link-muted">Soporte</a>
+          </footer>
+        </div>
+      </section>
+    </main>
+  </body>
+  <script src="./script.js"></script>
+  </html>

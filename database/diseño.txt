@@ -1,0 +1,81 @@
+CREATE TABLE "Tipo_usuario" (
+	"Id_Tipo"	INTEGER UNIQUE,
+	"Tipo"	TEXT NOT NULL,
+	PRIMARY KEY("Id_Tipo" AUTOINCREMENT)
+);
+
+CREATE TABLE "Usuarios" (
+	"Id_Usuarios"	INTEGER UNIQUE,
+	"Password"	TEXT NOT NULL,
+	"username"	TEXT NOT NULL,
+	"NombreCompleto"	TEXT,
+	"email"	INTEGER,
+	"Tipo_usuario"	INTEGER NOT NULL,
+	"Foto_perfil"	TEXT,
+	PRIMARY KEY("Id_Usuarios" AUTOINCREMENT),
+	FOREIGN KEY("Tipo_usuario") REFERENCES "Tipo_usuario"("Id_Tipo")
+);
+
+CREATE TABLE "attachments" (
+	"id"	INTEGER,
+	"chat_id"	INTEGER NOT NULL,
+	"message_id"	INTEGER NOT NULL,
+	"sender_id"	INTEGER NOT NULL,
+	"file_name"	TEXT NOT NULL,
+	"mime_type"	TEXT NOT NULL,
+	"size_bytes"	INTEGER,
+	"created_at"	DATETIME DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY("id" AUTOINCREMENT),
+	FOREIGN KEY("chat_id") REFERENCES "chats"("chat_id") ON DELETE CASCADE,
+	FOREIGN KEY("message_id") REFERENCES "messages"("message_id") ON DELETE CASCADE,
+	FOREIGN KEY("sender_id") REFERENCES "Usuarios"("Id_Usuarios")
+);
+
+CREATE TABLE "chats" (
+	"chat_id"	INTEGER,
+	"is_group"	BOOLEAN NOT NULL CHECK("is_group" IN (0, 1)),
+	"created_by"	INTEGER NOT NULL,
+	"created_at"	DATETIME DEFAULT CURRENT_TIMESTAMP,
+	"last_activity"	DATETIME,
+	PRIMARY KEY("chat_id" AUTOINCREMENT),
+	FOREIGN KEY("created_by") REFERENCES "Usuarios"("Id_Usuarios")
+);
+CREATE TABLE "chat_members" (
+	"chat_id"	INTEGER NOT NULL,
+	"user_id"	INTEGER NOT NULL,
+	"joined_at"	DATETIME DEFAULT CURRENT_TIMESTAMP,
+	"role"	TEXT,
+	PRIMARY KEY("chat_id","user_id"),
+	FOREIGN KEY("chat_id") REFERENCES "chats"("chat_id"),
+	FOREIGN KEY("user_id") REFERENCES "Usuarios"("Id_Usuarios")
+);
+
+CREATE TABLE "info_grupos" (
+	"chat_id"	INTEGER NOT NULL,
+	"nombre"	TEXT NOT NULL,
+	"descripcion"	TEXT
+);
+
+CREATE TABLE "messages" (
+	"message_id"	INTEGER,
+	"chat_id"	INTEGER NOT NULL,
+	"user_id"	INTEGER NOT NULL,
+	"content"	TEXT,
+	"created_at"	DATETIME DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY("message_id" AUTOINCREMENT),
+	FOREIGN KEY("chat_id") REFERENCES "chats"("chat_id"),
+	FOREIGN KEY("user_id") REFERENCES "Usuarios"("Id_Usuarios")
+);
+
+CREATE TABLE "sqlite_sequence" (
+	"name"	,
+	"seq"	
+);
+
+CREATE TABLE "status" (
+	"iD"	INTEGER UNIQUE,
+	"fecha"	DATETIME DEFAULT CURRENT_TIMESTAMP,
+	"status"	TEXT NOT NULL,
+	"iD_User"	INTEGER NOT NULL,
+	PRIMARY KEY("iD" AUTOINCREMENT)
+);
