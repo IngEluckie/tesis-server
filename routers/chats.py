@@ -1,15 +1,20 @@
 # chats.py
 
 # Importamos librerías
+import logging
+from typing import Optional, List
+
 from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
-from typing import Optional, List
 
 # Importamos módulos
 from routers.auth import current_user, User
 from database.singleton import Database
+from routers.websocket import notify_new_message
 
 router_chats: APIRouter = APIRouter(prefix="/chats")
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_user_id(user: User) -> int:
@@ -36,6 +41,11 @@ PARA EL ENVÍO DE MENSAJES
 class MessageCreate(BaseModel):
     content: str
 
+
+class PaginationMeta(BaseModel):
+    older_cursor: str | None = None
+    has_more_older: bool = False
+
 # Función para crear un mensaje en la BD
 def create_message(db: Database, chat_id: int, user_id: int, content: str) -> dict:
     insert_query = """
@@ -52,11 +62,26 @@ def create_message(db: Database, chat_id: int, user_id: int, content: str) -> di
         )
 
     message_id = row[0]["message_id"]
+    db.execute_query(
+        """
+        UPDATE chats
+        SET last_activity = CURRENT_TIMESTAMP
+        WHERE chat_id = ?
+        """,
+        (chat_id,),
+    )
     message_rows = db.fetch_query(
         """
-        SELECT message_id, chat_id, user_id, content, created_at
-        FROM messages
-        WHERE message_id = ?
+        SELECT
+            m.message_id,
+            m.chat_id,
+            m.user_id,
+            u.username AS sender_username,
+            m.content,
+            m.created_at
+        FROM messages AS m
+        INNER JOIN Usuarios AS u ON u.Id_Usuarios = m.user_id
+        WHERE m.message_id = ?
         """,
         (message_id,),
     )
@@ -65,11 +90,6 @@ def create_message(db: Database, chat_id: int, user_id: int, content: str) -> di
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="No se encontró el mensaje recién creado."
         )
-
-    db.execute_query(
-        "UPDATE chats SET last_activity = CURRENT_TIMESTAMP WHERE chat_id = ?",
-        (chat_id,),
-    )
 
     return message_rows[0]
 
@@ -87,16 +107,7 @@ async def send_message_to_chat(
     db = Database()
     user_id = _extract_user_id(user)
 
-    membership_rows = db.fetch_query(
-        """
-        SELECT COUNT(*) AS count
-        FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        """,
-        (chat_id, user_id),
-    )
-    is_member = membership_rows and membership_rows[0]["count"] > 0
-    if not is_member:
+    if not _user_is_member(db, chat_id, user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No tienes permiso para enviar mensajes a este chat.",
@@ -109,7 +120,16 @@ async def send_message_to_chat(
             detail="El contenido del mensaje no puede estar vacío.",
         )
 
-    return create_message(db, chat_id, user_id, content)
+    message_created = create_message(db, chat_id, user_id, content)
+
+    try:
+        await notify_new_message(message_created)
+    except Exception:
+        logger.exception(
+            "Fallo al notificar un mensaje nuevo para el chat %s", chat_id
+        )
+
+    return message_created
 
 
 """
@@ -177,7 +197,17 @@ def create_single_chat(db: Database, creator_id: int, other_user_id: int) -> int
 
     return chat_id
 
-def fetch_chat_messages(db: Database, chat_id: int, limit: int = 20, offset: int = 0) -> List[dict]:
+def fetch_chat_messages(
+    db: Database,
+    chat_id: int,
+    limit: int = 20,
+    older_cursor: str | None = None,
+) -> tuple[List[dict], PaginationMeta]:
+    """
+    Obtiene los mensajes más recientes de un chat en orden cronológico ascendente.
+    Usa older_cursor (timestamp ISO) para paginar hacia mensajes más antiguos.
+    """
+    base_limit = max(limit, 1)
     query = """
         SELECT
             m.message_id,
@@ -189,18 +219,34 @@ def fetch_chat_messages(db: Database, chat_id: int, limit: int = 20, offset: int
         FROM messages AS m
         INNER JOIN Usuarios AS u ON u.Id_Usuarios = m.user_id
         WHERE m.chat_id = ?
-        ORDER BY m.created_at DESC
-        LIMIT ? OFFSET ?
     """
-    rows = db.fetch_query(query, (chat_id, limit, offset))
-    return rows or []
+    params: list = [chat_id]
+    if older_cursor:
+        query += " AND m.created_at < ?"
+        params.append(older_cursor)
+
+    query += " ORDER BY m.created_at DESC LIMIT ?"
+    params.append(base_limit + 1)  # +1 para detectar si hay más mensajes antiguos
+
+    rows = db.fetch_query(query, tuple(params)) or []
+
+    has_more = len(rows) > base_limit
+    trimmed = rows[:base_limit]
+    trimmed.reverse()  # Cronológico ascendente
+
+    meta = PaginationMeta()
+    if trimmed:
+        meta.older_cursor = trimmed[0]["created_at"]
+    meta.has_more_older = has_more
+
+    return trimmed, meta
 
 ### AQUI LA RUTA PRINCIPAL QUE RECIBE UN STRING (target_username)
 @router_chats.get("/open_single_chat/{target_username}")
 async def open_single_chat(
     target_username: str,
     limit: int = 20,
-    offset: int = 0,
+    older_cursor: str | None = None,
     user: User = Depends(current_user),  # <--- 'user' viene de tu modelo 'User' con iD, username, ...
 ):
     db = Database()
@@ -223,11 +269,12 @@ async def open_single_chat(
     if existing_chat_id is None:
         existing_chat_id = create_single_chat(db, requester_id, other_user_id)
 
-    messages = fetch_chat_messages(db, existing_chat_id, limit, offset)
+    messages, meta = fetch_chat_messages(db, existing_chat_id, limit, older_cursor)
 
     return {
         "chat_id": existing_chat_id,
         "messages": messages,
+        "pagination": meta.model_dump(),
     }
 
 @router_chats.get("/me")
@@ -302,7 +349,7 @@ async def get_my_chats(limit: int = 10, offset: int = 0, user: User = Depends(cu
 async def get_chat(
     chat_id: int,
     limit: int = 20,
-    offset: int = 0,
+    older_cursor: str | None = None,
     user: User = Depends(current_user)
 ):
     """
@@ -312,21 +359,28 @@ async def get_chat(
     db = Database()
     user_id = _extract_user_id(user)
 
-    membership_rows = db.fetch_query(
-        """
-        SELECT COUNT(*) AS count
-        FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        """,
-        (chat_id, user_id),
-    )
-
-    has_access = membership_rows and membership_rows[0]["count"] > 0
-    if not has_access:
+    if not _user_is_member(db, chat_id, user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No tienes permiso para acceder a este chat.",
         )
 
-    messages = fetch_chat_messages(db, chat_id, limit, offset)
-    return {"chat_id": chat_id, "messages": messages}
+    messages, meta = fetch_chat_messages(db, chat_id, limit, older_cursor)
+    return {
+        "chat_id": chat_id,
+        "messages": messages,
+        "pagination": meta.model_dump(),
+    }
+
+
+def _user_is_member(db: Database, chat_id: int, user_id: int) -> bool:
+    membership_rows = db.fetch_query(
+        """
+        SELECT 1
+        FROM chat_members
+        WHERE chat_id = ? AND user_id = ?
+        LIMIT 1
+        """,
+        (chat_id, user_id),
+    )
+    return bool(membership_rows)
