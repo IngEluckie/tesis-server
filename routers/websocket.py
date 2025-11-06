@@ -14,6 +14,7 @@ from collections import defaultdict
 from contextlib import suppress
 import logging
 from typing import Any, Dict, Set
+import uuid
 
 from fastapi import (
     APIRouter,
@@ -46,6 +47,8 @@ PUBSUB_CHANNEL = os.getenv("CHAT_PUBSUB_CHANNEL", "chat_events")
 
 redis_sync = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 redis_async = AsyncRedis.from_url(REDIS_URL, decode_responses=True)
+
+PROCESS_ID = f"{os.getpid()}-{uuid.uuid4().hex}"
 
 
 def _membership_key(user_id: int) -> str:
@@ -106,8 +109,23 @@ class ConnectionManager:
             return bool(self._connections.get(user_id))
 
     async def publish_event(self, event: Dict[str, Any]) -> None:
-        payload = json.dumps(event, ensure_ascii=False)
-        await redis_async.publish(PUBSUB_CHANNEL, payload)
+        enriched_event = dict(event)
+        enriched_event.setdefault("origin", PROCESS_ID)
+        payload = json.dumps(enriched_event, ensure_ascii=False)
+
+        redis_error: Exception | None = None
+        try:
+            await redis_async.publish(PUBSUB_CHANNEL, payload)
+        except Exception as exc:  # Redis debe ser opcional para el broadcast
+            redis_error = exc
+            logger.warning("Fallo al publicar evento en Redis: %s", exc)
+
+        chat_id = enriched_event.get("chat_id")
+        if isinstance(chat_id, int):
+            await self.broadcast_event(chat_id, enriched_event)
+
+        if redis_error:
+            logger.debug("Redis no disponible; se usó broadcast local para chat %s", chat_id)
 
     async def broadcast_event(self, chat_id: int, event: Dict[str, Any]) -> None:
         async with self._lock:
@@ -149,6 +167,9 @@ class ConnectionManager:
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
+            return
+
+        if event.get("origin") == PROCESS_ID:
             return
 
         if event.get("type") == "chat.message":

@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from database.singleton import Database
 
 # Iniciamos router
-router_authentication = APIRouter(prefix="/auth")
+router_authentication: APIRouter = APIRouter(prefix="/auth")
 #r = redis.Redis(host='localhost', port=6379, db=0)
 
 # Cargar variables de entorno

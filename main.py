@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 import os
 
 # Import modules
-from routers import auth, websocket, chats
+from routers import auth, websocket, chats, files
 from database.singleton import Database
 
 # Start server
@@ -18,6 +18,7 @@ app: FastAPI = FastAPI()
 app.include_router(auth.router_authentication)
 app.include_router(websocket.router_websockets)
 app.include_router(chats.router_chats)
+app.include_router(files.router_files)
 
 app.add_middleware(
     CORSMiddleware,
