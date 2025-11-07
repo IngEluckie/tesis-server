@@ -24,6 +24,7 @@ CREATE TABLE "attachments" (
 	"file_name"	TEXT NOT NULL,
 	"mime_type"	TEXT NOT NULL,
 	"size_bytes"	INTEGER,
+	"original_name"	TEXT,
 	"created_at"	DATETIME DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY("id" AUTOINCREMENT),
 	FOREIGN KEY("chat_id") REFERENCES "chats"("chat_id") ON DELETE CASCADE,

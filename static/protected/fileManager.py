@@ -7,8 +7,11 @@ Bodyguard for all protected files
 # Import libreries
 from dataclasses import dataclass
 from pathlib import Path
+import mimetypes
 import shutil
 import io
+import re
+from typing import Iterable
 from uuid import uuid4
 from contextlib import contextmanager
 
@@ -22,6 +25,18 @@ class ProfileImageInfo:
     user_id: int
     filename: str
     path: str
+
+
+@dataclass
+class AttachmentInfo:
+    chat_id: int
+    sender_id: int
+    original_filename: str
+    stored_filename: str
+    relative_path: str
+    absolute_path: str
+    mime_type: str
+    size_bytes: int
 
 
 @dataclass
@@ -160,6 +175,119 @@ class FileManager:
         return True
 
     pass
+
+
+class ChatAttachmentManager(FileManager):
+    """
+    Gestor de archivos adjuntos asociados a chats.
+    Valida extensiones y tipos MIME permitidos, normaliza nombres y
+    almacena los archivos dentro de la colección `chats_files`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.collection: Path = Path("chats_files")
+        self.allowed_extensions: dict[str, set[str]] = self._build_allowed_mime_map()
+
+    @staticmethod
+    def _build_allowed_mime_map() -> dict[str, set[str]]:
+        fallback = {"application/octet-stream"}
+        mapping: dict[str, Iterable[str]] = {
+            ".jpg": {"image/jpeg"},
+            ".jpeg": {"image/jpeg"},
+            ".png": {"image/png"},
+            ".zip": {"application/zip"},
+            ".doc": {"application/msword"},
+            ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+            ".ppt": {"application/vnd.ms-powerpoint"},
+            ".pptx": {"application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+            ".xls": {"application/vnd.ms-excel"},
+            ".xlsx": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            ".md": {"text/markdown", "text/plain"},
+        }
+        return {ext: set(types) | fallback for ext, types in mapping.items()}
+
+    def _ensure_chat_folder(self, chat_id: int) -> Path:
+        collection_path = self.collection / f"chat_{chat_id}"
+        folder = self._coerce_target(collection_path)
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _sanitize_basename(self, name: str) -> str:
+        base = Path(name).stem or "file"
+        sanitized = re.sub(r"[^A-Za-z0-9_\-]", "_", base)
+        sanitized = sanitized.strip("_") or "file"
+        return sanitized[:80]
+
+    def _validate_extension(self, filename: str) -> str:
+        extension = Path(filename or "").suffix.lower()
+        if extension not in self.allowed_extensions:
+            raise ValueError(
+                f"Extensión de archivo no permitida: {extension or 'sin extensión'}."
+            )
+        return extension
+
+    def _normalize_mime(self, filename: str, content_type: str | None) -> str:
+        normalized = (content_type or "").lower().strip()
+        if not normalized:
+            guessed, _ = mimetypes.guess_type(filename)
+            normalized = (guessed or "application/octet-stream").lower()
+        return normalized
+
+    def store_attachment(
+        self,
+        *,
+        chat_id: int,
+        sender_id: int,
+        filename: str,
+        payload: bytes,
+        content_type: str | None = None,
+    ) -> AttachmentInfo:
+        if not payload:
+            raise ValueError("El archivo está vacío.")
+        extension = self._validate_extension(filename)
+        mime_type = self._normalize_mime(filename, content_type)
+        allowed_mimes = self.allowed_extensions[extension]
+        if mime_type not in allowed_mimes:
+            raise ValueError(
+                f"Tipo MIME '{mime_type}' no coincide con la extensión {extension}."
+            )
+
+        folder = self._ensure_chat_folder(chat_id)
+        basename = self._sanitize_basename(filename)
+        unique_name = f"{basename}-{uuid4().hex[:8]}{extension}"
+        destination = folder / unique_name
+
+        with destination.open("wb") as buffer:
+            buffer.write(payload)
+
+        relative_path = str(Path(self.collection) / f"chat_{chat_id}" / unique_name)
+
+        return AttachmentInfo(
+            chat_id=chat_id,
+            sender_id=sender_id,
+            original_filename=filename,
+            stored_filename=unique_name,
+            relative_path=relative_path,
+            absolute_path=str(destination.resolve()),
+            mime_type=mime_type,
+            size_bytes=len(payload),
+        )
+
+    def resolve_relative_path(self, relative_path: str) -> Path:
+        return self._coerce_target(relative_path)
+
+    def delete_attachment(self, relative_path: str) -> None:
+        target = self.resolve_relative_path(relative_path)
+        if target.exists():
+            target.unlink()
+            parent = target.parent
+            try:
+                if parent != self.root and parent.name.startswith("chat_") and not any(parent.iterdir()):
+                    parent.rmdir()
+            except OSError:
+                pass
+
 
 class ProfileImage(FileManager):
 

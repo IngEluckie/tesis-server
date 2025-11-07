@@ -10,6 +10,7 @@ from pydantic import BaseModel
 # Importamos módulos
 from routers.auth import current_user, User
 from database.singleton import Database
+from database.attachments import fetch_attachments_by_message_ids, serialize_attachment
 from routers.websocket import notify_new_message
 
 router_chats: APIRouter = APIRouter(prefix="/chats")
@@ -91,7 +92,9 @@ def create_message(db: Database, chat_id: int, user_id: int, content: str) -> di
             detail="No se encontró el mensaje recién creado."
         )
 
-    return message_rows[0]
+    message = message_rows[0]
+    message["attachments"] = []
+    return message
 
 @router_chats.post("/{chat_id}/send_message")
 async def send_message_to_chat(
@@ -233,6 +236,12 @@ def fetch_chat_messages(
     has_more = len(rows) > base_limit
     trimmed = rows[:base_limit]
     trimmed.reverse()  # Cronológico ascendente
+
+    message_ids = [message["message_id"] for message in trimmed]
+    attachments_map = fetch_attachments_by_message_ids(db, message_ids)
+    for message in trimmed:
+        attachments = attachments_map.get(message["message_id"], [])
+        message["attachments"] = [serialize_attachment(item) for item in attachments]
 
     meta = PaginationMeta()
     if trimmed:
