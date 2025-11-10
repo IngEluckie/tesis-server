@@ -24,7 +24,12 @@ from PIL import Image, ImageOps
 class ProfileImageInfo:
     user_id: int
     filename: str
-    path: str
+    relative_path: str
+    absolute_path: str
+
+    @property
+    def path(self) -> str:
+        return self.absolute_path
 
 
 @dataclass
@@ -324,15 +329,33 @@ class ProfileImage(FileManager):
 
     def _build_filename(self, *, user_id: int | None, extension: str | None, filename: str | None) -> str:
         ext = (extension or "").lower()
-        if filename:
-            candidate = filename
-            if Path(candidate).suffix.lower() not in self.allowed_formats:
-                candidate += self.default_extension
-            return candidate
         if ext not in self.allowed_formats:
             ext = self.default_extension
-        base = f"user_{user_id}" if user_id is not None else "profile"
-        return f"{base}_{uuid4().hex}{ext}"
+        base = Path(filename or "").stem
+        base = re.sub(r"[^A-Za-z0-9_\-]", "_", base).strip("_")
+        if not base:
+            base = f"user_{user_id}" if user_id is not None else "profile"
+        unique_suffix = uuid4().hex[:12]
+        return f"{base[:80]}_{unique_suffix}{ext}"
+
+    def _build_relative_path(self, filename: str) -> Path:
+        return Path(self.collection) / filename
+
+    def resolve_relative_path(self, relative_path: str) -> Path:
+        if not relative_path:
+            raise ValueError("No se proporcionó una ruta relativa.")
+        return self._coerce_target(relative_path)
+
+    def delete_profile_image(self, relative_path: str, *, missing_ok: bool = True) -> bool:
+        target = self.resolve_relative_path(relative_path)
+        if not target.exists():
+            if missing_ok:
+                return False
+            raise FileNotFoundError(f"No existe la imagen de perfil en {target}.")
+        if target.is_dir():
+            raise IsADirectoryError(f"{target} es un directorio, no una imagen.")
+        target.unlink()
+        return True
 
     @contextmanager
     def _open_image(
@@ -399,7 +422,8 @@ class ProfileImage(FileManager):
         format_name = self.allowed_formats.get(Path(final_filename).suffix.lower(), self.allowed_formats[self.default_extension])
 
         self._ensure_collection_folder()
-        destination = self._coerce_target(Path(self.collection) / final_filename)
+        relative_path = self._build_relative_path(final_filename)
+        destination = self._coerce_target(relative_path)
         if destination.exists() and not overwrite:
             raise FileExistsError(f"Ya existe un archivo en {destination}")
 
@@ -410,7 +434,8 @@ class ProfileImage(FileManager):
         return ProfileImageInfo(
             user_id=user_id or -1,
             filename=final_filename,
-            path=str(destination),
+            relative_path=relative_path.as_posix(),
+            absolute_path=str(destination.resolve()),
         )
 
     pass

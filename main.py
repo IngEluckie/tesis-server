@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 import os
 
 # Import modules
-from routers import auth, websocket, chats, files
+from routers import auth, websocket, chats, files, users
 from database.singleton import Database
 
 # Start server
@@ -19,6 +19,7 @@ app.include_router(auth.router_authentication)
 app.include_router(websocket.router_websockets)
 app.include_router(chats.router_chats)
 app.include_router(files.router_files)
+app.include_router(users.router_users)
 
 app.add_middleware(
     CORSMiddleware,
