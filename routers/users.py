@@ -15,7 +15,11 @@ from fastapi.responses import FileResponse
 
 from routers.auth import User, current_user
 from database.singleton import Database
-from database.users import fetch_user_by_id, update_user_profile_image
+from database.users import (
+    fetch_user_by_id,
+    fetch_user_by_username,
+    update_user_profile_image,
+)
 from static.protected.fileManager import ProfileImage
 
 
@@ -46,6 +50,26 @@ def _ensure_user(db: Database, user_id: int) -> dict:
             detail="Usuario no encontrado.",
         )
     return record
+
+
+def _ensure_user_by_username(db: Database, username: str) -> dict:
+    record = fetch_user_by_username(db, username)
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuario no encontrado.",
+        )
+    return record
+
+
+def _normalize_username(value: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debes proporcionar un nombre de usuario válido.",
+        )
+    return normalized
 
 
 def _serve_profile_image(relative_path: str) -> FileResponse:
@@ -179,4 +203,16 @@ async def get_user_profile_image(
     db = Database()
     _ensure_user(db, _extract_user_id(user))
     record = _ensure_user(db, target_user_id)
+    return _serve_profile_image(record.get("profile_image"))
+
+
+@router_users.get("/by-username/{target_username}/avatar")
+async def get_user_profile_image_by_username(
+    target_username: str,
+    user: User = Depends(current_user),
+):
+    db = Database()
+    _ensure_user(db, _extract_user_id(user))
+    normalized_username = _normalize_username(target_username)
+    record = _ensure_user_by_username(db, normalized_username)
     return _serve_profile_image(record.get("profile_image"))

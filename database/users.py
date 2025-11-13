@@ -32,3 +32,25 @@ def update_user_profile_image(db: Database, user_id: int, relative_path: str | N
         WHERE Id_Usuarios = ?
     """
     db.execute_query(query, (relative_path, user_id))
+
+
+def fetch_user_by_username(db: Database, username: str) -> Optional[dict]:
+    normalized = (username or "").strip()
+    if not normalized:
+        return None
+
+    query = """
+        SELECT
+            Id_Usuarios AS user_id,
+            username,
+            NombreCompleto AS full_name,
+            email,
+            Foto_perfil AS profile_image
+        FROM Usuarios
+        WHERE LOWER(username) = LOWER(?)
+        LIMIT 1
+    """
+    rows = db.fetch_query(query, (normalized,))
+    if not rows:
+        return None
+    return rows[0]
