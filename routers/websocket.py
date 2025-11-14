@@ -13,6 +13,9 @@ import os
 from collections import defaultdict
 from contextlib import suppress
 import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, Set
 import uuid
 
@@ -49,12 +52,107 @@ redis_sync = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 redis_async = AsyncRedis.from_url(REDIS_URL, decode_responses=True)
 
 PROCESS_ID = f"{os.getpid()}-{uuid.uuid4().hex}"
+CONNECTION_TTL_SECONDS = int(os.getenv("WEBSOCKET_CONNECTION_TTL", "120"))
+HEARTBEAT_INTERVAL = int(os.getenv("WEBSOCKET_HEARTBEAT_INTERVAL", "30"))
+IDLE_TIMEOUT = int(os.getenv("WEBSOCKET_IDLE_TIMEOUT", "90"))
+PRESENCE_TOUCH_INTERVAL = int(os.getenv("WEBSOCKET_PRESENCE_TOUCH_INTERVAL", "15"))
 
 
 def _membership_key(user_id: int) -> str:
     return f"connection:{user_id}"
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+async def _presence_touch(user_id: int) -> None:
+    key = _membership_key(user_id)
+    timestamp = _utcnow_iso()
+    try:
+        pipe = redis_async.pipeline()
+        pipe.hset(key, mapping={"last_seen": timestamp})
+        pipe.expire(key, CONNECTION_TTL_SECONDS)
+        await pipe.execute()
+    except Exception as exc:
+        logger.debug("No se pudo refrescar la presencia del usuario %s: %s", user_id, exc)
+
+
+async def _presence_increment(user: User) -> Dict[str, Any]:
+    key = _membership_key(user.user_id)
+    timestamp = _utcnow_iso()
+    payload = {
+        "status": "connected",
+        "username": user.username,
+        "name": user.name or "",
+        "email": user.email or "",
+        "last_seen": timestamp,
+    }
+    connection_count: int | None = None
+    try:
+        connection_count = await redis_async.hincrby(key, "connection_count", 1)
+        await redis_async.hset(key, mapping=payload)
+        await redis_async.expire(key, CONNECTION_TTL_SECONDS)
+    except Exception as exc:
+        logger.warning("No se pudo registrar la conexión WebSocket para %s: %s", user.user_id, exc)
+        connection_count = None
+    return {
+        "status": payload["status"],
+        "last_seen": timestamp,
+        "connection_count": connection_count,
+    }
+
+
+async def _presence_decrement(user_id: int, *, fallback_status: str) -> Dict[str, Any]:
+    key = _membership_key(user_id)
+    timestamp = _utcnow_iso()
+    status = fallback_status
+    connection_count: int | None = None
+    try:
+        connection_count = await redis_async.hincrby(key, "connection_count", -1)
+        if connection_count < 0:
+            connection_count = 0
+            await redis_async.hset(key, "connection_count", 0)
+        if connection_count > 0:
+            status = "connected"
+        await redis_async.hset(
+            key,
+            mapping={
+                "status": status,
+                "last_seen": timestamp,
+            },
+        )
+        await redis_async.expire(key, CONNECTION_TTL_SECONDS)
+    except Exception as exc:
+        logger.warning("No se pudo registrar la desconexión de %s: %s", user_id, exc)
+        connection_count = None
+    return {
+        "status": status,
+        "last_seen": timestamp,
+        "connection_count": connection_count,
+    }
+
+
+def _presence_event(user_id: int, presence: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "user.status",
+        "user_id": user_id,
+        "status": presence.get("status"),
+        "last_seen": presence.get("last_seen"),
+        "connection_count": presence.get("connection_count"),
+    }
+
+
+@dataclass
+class ConnectionState:
+    websocket: WebSocket
+    last_activity: float = field(default_factory=time.monotonic)
+    last_presence_refresh: float = field(default_factory=lambda: 0.0)
+    pending_ping_id: str | None = None
+    heartbeat_task: asyncio.Task | None = None
+    disconnect_status: str = "disconnected"
 
 
 class ConnectionManager:
@@ -65,7 +163,7 @@ class ConnectionManager:
     """
 
     def __init__(self) -> None:
-        self._connections: Dict[int, Dict[int, WebSocket]] = {}
+        self._connections: Dict[int, Dict[int, ConnectionState]] = {}
         self._subscriptions: Dict[int, Set[int]] = defaultdict(set)
         self._lock = asyncio.Lock()
         self._listener_task: asyncio.Task | None = None
@@ -73,23 +171,36 @@ class ConnectionManager:
     async def connect(self, user_id: int, websocket: WebSocket) -> None:
         async with self._lock:
             user_connections = self._connections.setdefault(user_id, {})
-            user_connections[id(websocket)] = websocket
+            state = ConnectionState(websocket=websocket)
+            user_connections[id(websocket)] = state
             self._subscriptions.setdefault(user_id, set())
+        state.heartbeat_task = asyncio.create_task(self._heartbeat_loop(user_id, id(websocket)))
         await self._ensure_listener()
 
-    async def disconnect(self, user_id: int, websocket: WebSocket | None = None) -> None:
+    async def disconnect(self, user_id: int, websocket: WebSocket | None = None) -> ConnectionState | None:
+        removed_state: ConnectionState | None = None
         async with self._lock:
             if websocket is None:
-                self._connections.pop(user_id, None)
+                states = self._connections.pop(user_id, {})
                 self._subscriptions.pop(user_id, None)
-                return
+                for state in states.values():
+                    if state.heartbeat_task:
+                        state.heartbeat_task.cancel()
+                return None
 
             connections = self._connections.get(user_id)
-            if connections:
-                connections.pop(id(websocket), None)
-                if not connections:
-                    self._connections.pop(user_id, None)
-                    self._subscriptions.pop(user_id, None)
+            if not connections:
+                return None
+
+            removed_state = connections.pop(id(websocket), None)
+
+            if removed_state and removed_state.heartbeat_task:
+                removed_state.heartbeat_task.cancel()
+
+            if not connections:
+                self._connections.pop(user_id, None)
+                self._subscriptions.pop(user_id, None)
+        return removed_state
 
     async def subscribe(self, user_id: int, chat_id: int) -> None:
         async with self._lock:
@@ -120,19 +231,31 @@ class ConnectionManager:
             redis_error = exc
             logger.warning("Fallo al publicar evento en Redis: %s", exc)
 
-        chat_id = enriched_event.get("chat_id")
-        if isinstance(chat_id, int):
-            await self.broadcast_event(chat_id, enriched_event)
+        event_type = enriched_event.get("type")
+        if event_type == "chat.message":
+            chat_id = enriched_event.get("chat_id")
+            if isinstance(chat_id, int):
+                await self.broadcast_event(chat_id, enriched_event)
+        elif event_type == "user.status":
+            await self.broadcast_all(enriched_event)
 
         if redis_error:
-            logger.debug("Redis no disponible; se usó broadcast local para chat %s", chat_id)
+            logger.debug("Redis no disponible; se usó broadcast local para evento %s", event_type)
 
     async def broadcast_event(self, chat_id: int, event: Dict[str, Any]) -> None:
         async with self._lock:
             recipients: list[WebSocket] = []
             for uid, connections in self._connections.items():
                 if chat_id in self._subscriptions.get(uid, set()):
-                    recipients.extend(connections.values())
+                    recipients.extend(state.websocket for state in connections.values())
+
+        for ws in recipients:
+            with suppress(RuntimeError, WebSocketDisconnect):
+                await ws.send_json(event)
+
+    async def broadcast_all(self, event: Dict[str, Any]) -> None:
+        async with self._lock:
+            recipients = [state.websocket for connections in self._connections.values() for state in connections.values()]
 
         for ws in recipients:
             with suppress(RuntimeError, WebSocketDisconnect):
@@ -176,6 +299,74 @@ class ConnectionManager:
             chat_id = event.get("chat_id")
             if isinstance(chat_id, int):
                 await self.broadcast_event(chat_id, event)
+        elif event.get("type") == "user.status":
+            await self.broadcast_all(event)
+
+    async def mark_activity(self, user_id: int, websocket: WebSocket, *, ping_id: str | None = None) -> None:
+        should_refresh_presence = False
+        async with self._lock:
+            connections = self._connections.get(user_id, {})
+            state = connections.get(id(websocket))
+            if not state:
+                return
+            if ping_id is not None:
+                expected = state.pending_ping_id
+                if expected and expected != ping_id:
+                    logger.debug(
+                        "Ping ID no coincide para el usuario %s: esperado %s, recibido %s",
+                        user_id,
+                        expected,
+                        ping_id,
+                    )
+                state.pending_ping_id = None
+            now = time.monotonic()
+            state.last_activity = now
+            if now - state.last_presence_refresh >= PRESENCE_TOUCH_INTERVAL:
+                should_refresh_presence = True
+                state.last_presence_refresh = now
+
+        if should_refresh_presence:
+            await _presence_touch(user_id)
+
+    async def _heartbeat_loop(self, user_id: int, connection_key: int) -> None:
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                async with self._lock:
+                    connections = self._connections.get(user_id)
+                    if not connections:
+                        return
+                    state = connections.get(connection_key)
+                    if not state:
+                        return
+                    websocket = state.websocket
+                    last_activity = state.last_activity
+                now = time.monotonic()
+                if now - last_activity > IDLE_TIMEOUT:
+                    state.disconnect_status = "inactive"
+                    with suppress(RuntimeError, WebSocketDisconnect):
+                        await websocket.close(code=4408)
+                    return
+
+                ping_id = uuid.uuid4().hex
+                async with self._lock:
+                    connections = self._connections.get(user_id)
+                    if not connections:
+                        return
+                    state = connections.get(connection_key)
+                    if not state:
+                        return
+                    state.pending_ping_id = ping_id
+                with suppress(RuntimeError, WebSocketDisconnect):
+                    await websocket.send_json(
+                        {
+                            "type": "system.ping",
+                            "ping_id": ping_id,
+                            "server_timestamp": _utcnow_iso(),
+                        }
+                    )
+        except asyncio.CancelledError:
+            raise
 
 
 manager = ConnectionManager()
@@ -269,17 +460,20 @@ async def create_or_confirm_connection(user: User = Depends(current_user)):
         user_id = user.user_id
         key = _membership_key(user_id)
 
-        if not redis_sync.exists(key):
-            connection_info = {
-                "status": "connected",
-                "username": user.username,
-                "name": user.name or "",
-                "email": user.email or "",
-            }
-            redis_sync.hset(key, mapping=connection_info)
-            message = "Connection created"
-        else:
-            message = "Connection already registered"
+        is_new = not redis_sync.exists(key)
+        connection_info = {
+            "status": "connecting",
+            "username": user.username,
+            "name": user.name or "",
+            "email": user.email or "",
+            "last_seen": _utcnow_iso(),
+        }
+        pipe = redis_sync.pipeline()
+        pipe.hset(key, mapping=connection_info)
+        pipe.hsetnx(key, "connection_count", 0)
+        pipe.expire(key, CONNECTION_TTL_SECONDS)
+        pipe.execute()
+        message = "Connection created" if is_new else "Connection refreshed"
 
         has_websocket = await manager.has_connection(user_id)
 
@@ -323,7 +517,9 @@ async def websocket_connection(websocket: WebSocket, token: str | None = None):
     await websocket.accept()
     await manager.connect(user_id, websocket)
 
-    redis_sync.hset(_membership_key(user_id), "status", "connected")
+    presence = await _presence_increment(user)
+    if presence.get("status"):
+        await manager.publish_event(_presence_event(user_id, presence))
 
     try:
         while True:
@@ -333,15 +529,36 @@ async def websocket_connection(websocket: WebSocket, token: str | None = None):
             except json.JSONDecodeError:
                 await websocket.send_json({"type": "chat.error", "error": "Formato inválido."})
                 continue
-
-            action = payload.get("type") or payload.get("action")
-            if not action:
+            action_value = payload.get("type") or payload.get("action")
+            if not action_value or not isinstance(action_value, str):
                 await websocket.send_json({"type": "chat.error", "error": "Acción no especificada."})
                 continue
+            action = action_value.lower()
 
-            if action in {"ping", "heartbeat"}:
-                await websocket.send_json({"type": "pong"})
+            if action in {"system.pong", "pong"}:
+                await manager.mark_activity(user_id, websocket, ping_id=payload.get("ping_id"))
+                await websocket.send_json(
+                    {
+                        "type": "system.pong",
+                        "ping_id": payload.get("ping_id"),
+                        "server_timestamp": _utcnow_iso(),
+                        "connection_ttl": CONNECTION_TTL_SECONDS,
+                    }
+                )
                 continue
+
+            if action in {"ping", "heartbeat", "system.ping"}:
+                await manager.mark_activity(user_id, websocket)
+                await websocket.send_json(
+                    {
+                        "type": "system.pong",
+                        "ping_id": payload.get("ping_id") or uuid.uuid4().hex,
+                        "server_timestamp": _utcnow_iso(),
+                        "connection_ttl": CONNECTION_TTL_SECONDS,
+                    }
+                )
+                continue
+            await manager.mark_activity(user_id, websocket)
 
             chat_id = payload.get("chat_id")
             if action in {"join", "join_chat"}:
@@ -364,8 +581,11 @@ async def websocket_connection(websocket: WebSocket, token: str | None = None):
     except WebSocketDisconnect:
         pass
     finally:
-        await manager.disconnect(user_id, websocket)
-        redis_sync.hset(_membership_key(user_id), "status", "disconnected")
+        state = await manager.disconnect(user_id, websocket)
+        disconnect_status = state.disconnect_status if state else "disconnected"
+        presence = await _presence_decrement(user_id, fallback_status=disconnect_status)
+        if presence.get("status"):
+            await manager.publish_event(_presence_event(user_id, presence))
 
 
 async def notify_new_message(message: Dict[str, Any]) -> None:

@@ -7,10 +7,11 @@ Other authenticated users can only read those images.
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 
 from routers.auth import User, current_user
@@ -21,10 +22,17 @@ from database.users import (
     update_user_profile_image,
 )
 from static.protected.fileManager import ProfileImage
+import redis
 
 
 router_users = APIRouter(prefix="/users", tags=["Users"])
 
+
+logger = logging.getLogger(__name__)
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CONNECTION_TTL_SECONDS = int(os.getenv("WEBSOCKET_CONNECTION_TTL", "120"))
+presence_redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 profile_image_manager = ProfileImage()
 PROFILE_IMAGE_MAX_BYTES = int(os.getenv("PROFILE_IMAGE_MAX_BYTES", 5 * 1024 * 1024))
@@ -98,6 +106,90 @@ def _serve_profile_image(relative_path: str) -> FileResponse:
         media_type=media_type or "image/png",
         filename=image_path.name,
     )
+
+
+def _presence_key(user_id: int) -> str:
+    return f"connection:{user_id}"
+
+
+def _read_presence(user_id: int) -> dict:
+    key = _presence_key(user_id)
+    try:
+        record = presence_redis.hgetall(key)
+    except Exception as exc:
+        logger.debug("No fue posible leer el estado de usuario %s: %s", user_id, exc)
+        record = {}
+
+    status_value = record.get("status") if record else None
+    status = status_value or "disconnected"
+    last_seen = record.get("last_seen") if record else None
+
+    connection_raw = record.get("connection_count") if record else None
+    try:
+        connection_count = int(connection_raw) if connection_raw is not None else 0
+    except (TypeError, ValueError):
+        connection_count = 0
+
+    ttl_seconds: int | None = None
+    try:
+        ttl_raw = presence_redis.ttl(key)
+    except Exception as exc:
+        logger.debug("No fue posible obtener el TTL de la presencia %s: %s", user_id, exc)
+    else:
+        if isinstance(ttl_raw, int) and ttl_raw >= 0:
+            ttl_seconds = ttl_raw
+
+    return {
+        "status": status,
+        "last_seen": last_seen,
+        "connection_count": connection_count,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
+@router_users.get("/status")
+async def get_users_status(
+    ids: str = Query(..., description="Lista separada por comas de identificadores de usuario."),
+    user: User = Depends(current_user),
+):
+    db = Database()
+    _ensure_user(db, _extract_user_id(user))
+
+    tokens = [segment.strip() for segment in (ids or "").split(",") if segment.strip()]
+    if not tokens:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Debes proporcionar al menos un identificador válido en 'ids'.",
+        )
+
+    target_ids: set[int] = set()
+    invalid_tokens: list[str] = []
+    for token in tokens:
+        try:
+            target_ids.add(int(token))
+        except ValueError:
+            invalid_tokens.append(token)
+
+    if invalid_tokens:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Identificadores inválidos: {', '.join(invalid_tokens)}.",
+        )
+
+    statuses = {target_id: _read_presence(target_id) for target_id in sorted(target_ids)}
+    return {"users": statuses}
+
+
+@router_users.get("/{target_user_id}/status")
+async def get_user_status(
+    target_user_id: int,
+    user: User = Depends(current_user),
+):
+    db = Database()
+    _ensure_user(db, _extract_user_id(user))
+    # Retorna 404 si el usuario objetivo no existe.
+    _ensure_user(db, target_user_id)
+    return _read_presence(target_user_id)
 
 
 @router_users.get("/me/avatar")
