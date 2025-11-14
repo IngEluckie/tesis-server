@@ -25,6 +25,7 @@ from fastapi import (
     HTTPException,
     WebSocket,
     WebSocketDisconnect,
+    WebSocketException,
     status,
 )
 from dotenv import load_dotenv
@@ -494,25 +495,23 @@ async def create_or_confirm_connection(user: User = Depends(current_user)):
 
 @router_websockets.websocket("/connection")
 async def websocket_connection(websocket: WebSocket, token: str | None = None):
+    user_id: int | None = None
+    user: User | None = None
     if not token:
-        await websocket.close(code=4401)
-        return
+        raise WebSocketException(code=4401, reason="Token requerido.")
 
     try:
         payload = jwt.decode(token, SECRET, algorithms=[ALGORITHM])
         user_id_str = payload.get("sub")
         if user_id_str is None:
-            await websocket.close(code=4401)
-            return
+            raise WebSocketException(code=4401, reason="Token inválido.")
         user_id = int(user_id_str)
     except (JWTError, ValueError, TypeError):
-        await websocket.close(code=4401)
-        return
+        raise WebSocketException(code=4401, reason="Token inválido.")
 
     user = search_user(user_id)
     if not user:
-        await websocket.close(code=4401)
-        return
+        raise WebSocketException(code=4401, reason="Usuario no encontrado.")
 
     await websocket.accept()
     await manager.connect(user_id, websocket)
@@ -523,7 +522,23 @@ async def websocket_connection(websocket: WebSocket, token: str | None = None):
 
     try:
         while True:
-            message = await websocket.receive_text()
+            logger.debug(
+                "Esperando mensaje de %s; estado actual: %s/%s",
+                user_id,
+                websocket.client_state,
+                websocket.application_state,
+            )
+            try:
+                message = await websocket.receive_text()
+            except RuntimeError as exc:
+                logger.warning(
+                    "Runtime al recibir mensaje para el usuario %s (estado %s/%s): %s",
+                    user_id,
+                    websocket.client_state,
+                    websocket.application_state,
+                    exc,
+                )
+                break
             try:
                 payload = json.loads(message)
             except json.JSONDecodeError:
@@ -578,14 +593,20 @@ async def websocket_connection(websocket: WebSocket, token: str | None = None):
                 await _handle_send_message(user_id, chat_id, payload.get("content", ""), websocket)
             else:
                 await websocket.send_json({"type": "chat.error", "error": f"Acción desconocida: {action}"})
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        logger.info(
+            "Cliente WebSocket %s desconectado: code=%s reason=%r",
+            user_id,
+            getattr(exc, "code", None),
+            getattr(exc, "reason", ""),
+        )
     finally:
-        state = await manager.disconnect(user_id, websocket)
-        disconnect_status = state.disconnect_status if state else "disconnected"
-        presence = await _presence_decrement(user_id, fallback_status=disconnect_status)
-        if presence.get("status"):
-            await manager.publish_event(_presence_event(user_id, presence))
+        if user_id is not None:
+            state = await manager.disconnect(user_id, websocket)
+            disconnect_status = state.disconnect_status if state else "disconnected"
+            presence = await _presence_decrement(user_id, fallback_status=disconnect_status)
+            if presence.get("status"):
+                await manager.publish_event(_presence_event(user_id, presence))
 
 
 async def notify_new_message(message: Dict[str, Any]) -> None:

@@ -54,11 +54,19 @@ app.mount("/", StaticFiles(directory="static/public", html=True), name="static/p
 if __name__ == "__main__":
     import uvicorn
 
+    reload_enabled = os.getenv("APP_RELOAD", "true").lower() == "true"
+    reload_excludes = [
+        "database/*.db",
+        "database/*.db-wal",
+        "database/*.db-shm",
+    ]
+
     uvicorn.run(
         "main:app",
         host=os.getenv("APP_HOST", "127.0.0.1"),
         port=int(os.getenv("APP_PORT", "8000")),
-        reload=os.getenv("APP_RELOAD", "true").lower() == "true",
+        reload=reload_enabled,
+        reload_excludes=reload_excludes if reload_enabled else None,
     )
 
 """
